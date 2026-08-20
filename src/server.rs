@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::response::IntoResponse;
+use axum::Json;
 use axum::{
     body::Body,
     extract::{self, State, Query},
@@ -32,6 +33,7 @@ pub async fn create_app(bot: Arc<teloxide::Bot>) -> Router {
     let mut router = Router::new()
         .route("/", get(root))
         .route("/files/:id", get(files_id))
+        .route("/api/files", get(files_api))
         .with_state(state);
 
     if enable_files_route {
@@ -153,6 +155,11 @@ async fn files_list() -> Result<Response<Body>, Infallible> {
         .header(CONTENT_TYPE, "text/html")
         .body(Body::from(html))
         .unwrap())
+}
+
+async fn files_api() -> Json<Vec<FileMetadata>> {
+    let files = list_all_files().await;
+    Json(files)
 }
 
 async fn files_id(
