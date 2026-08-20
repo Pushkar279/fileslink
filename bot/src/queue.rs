@@ -453,17 +453,19 @@ async fn edit_message_with_file_link(
     let full_path = build_url_path(unique_id, file_name);
     // Add auto-close parameter for better UX (closes tab after download starts)
     let full_url_with_close = format!("{}{}?close=1", file_domain, full_path);
+    let view_url = format!("{}{}", file_domain, full_path);
+    let download_url = format!("{}{}?dl=1&close=1", file_domain, full_path);
     info!("Generated download link: {}", full_url_with_close);
     let size_str = human_size(file_size as u64);
     let edit_result = bot.get_teloxide_bot().edit_message_text(
         queue_item.message.chat.id,
         queue_item.queue_message.id,
-        format!(
-            "✅ <b>File uploaded successfully!</b>\n\n📁 <b>File:</b> {}\n📊 <b>Size:</b> {}\n\n🔗 <b>Download Link:</b>\n<a href=\"{}\">{}</a>",
-            file_name,
-            size_str,
-            full_url_with_close,
-            full_url_with_close
+       format!(
+    "✅ <b>File uploaded successfully!</b>\n\n📁 <b>File:</b> {}\n📊 <b>Size:</b> {}\n\n👀 <b>View:</b>\n<a href=\"{}\">Open File</a>\n\n⬇️ <b>Download:</b>\n<a href=\"{}\">Download File</a>",
+    file_name,
+    size_str,
+    view_url,
+    download_url
         ),
     )
         .parse_mode(ParseMode::Html)
