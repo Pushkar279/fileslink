@@ -233,7 +233,7 @@ async fn files_id(
     };
 
     // Use original filename from metadata, force download as attachment
-    let content_disposition = format!("attachment; filename=\"{}\"", metadata.file_name);
+    let content_disposition = format!("inline; filename=\"{}\"", metadata.file_name);
 
     info!("Serving file: {} ({} bytes) with content type: {}", 
           metadata.file_name, file_bytes.len(), content_type);
