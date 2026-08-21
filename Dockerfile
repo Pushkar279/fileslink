@@ -19,10 +19,8 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY --from=build /build/target/release/fileslink /app/fileslink
-COPY --from=build /build/target/release/fileslink-cli /app/fileslink-cli
 
 RUN chmod +x /app/fileslink
-RUN chmod +x /app/fileslink-cli
 
 ENV PATH="/app:${PATH}"
 
