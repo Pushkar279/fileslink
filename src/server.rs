@@ -1,13 +1,14 @@
-use std::convert::Infallible;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::Json;
 use axum::{
     body::{Body, Bytes},
     extract::{self, DefaultBodyLimit, Query, State},
     response::{Html, IntoResponse, Response},
-    routing::{get, post, Router},
+    routing::{get, post},
+    Json, Router,
 };
 use http::{header::CONTENT_TYPE, StatusCode};
 use log::{debug, error, info, warn};
@@ -15,10 +16,14 @@ use teloxide::net::Download;
 use teloxide::payloads::SendDocumentSetters;
 use teloxide::prelude::Requester;
 use teloxide::types::{ChatId, InputFile};
-use base64::Engine;
-use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
-use shared::file_storage::{get_file_metadata, list_all_files, save_file_metadata, FileMetadata};
+use shared::file_storage::{
+    get_file_metadata,
+    list_all_files,
+    save_file_metadata,
+    FileMetadata,
+};
 use crate::config::Config;
 use shared::link_utils::extract_id_from_path;
 
@@ -28,7 +33,8 @@ pub struct AppState {
 }
 
 pub async fn create_app(bot: Arc<teloxide::Bot>) -> Router {
-    let enable_files_route = Config::instance().await.enable_files_route();
+    let enable_files_route =
+        Config::instance().await.enable_files_route();
 
     let state = AppState { bot };
 
@@ -43,95 +49,158 @@ pub async fn create_app(bot: Arc<teloxide::Bot>) -> Router {
         router = router.route("/files", get(files_list));
     }
 
-    // Allow large file uploads (50 MB) through the bot API.
-    router = router.layer(DefaultBodyLimit::max(50 * 1024 * 1024));
+    /*
+     * This limit applies to the incoming HTTP request.
+     *
+     * IMPORTANT:
+     * Telegram Bot API upload limits still apply separately.
+     */
+    router = router.layer(
+        DefaultBodyLimit::max(50 * 1024 * 1024)
+    );
 
     router.fallback(not_found_handler)
 }
 
-/// Proxy large file download to FastTelethon service
-async fn proxy_to_fasttelethon(metadata: &FileMetadata) -> Result<Response<Body>, Infallible> {
+
+// ------------------------------------------------------------
+// LARGE FILE DOWNLOAD THROUGH FASTTELETHON
+// ------------------------------------------------------------
+
+async fn proxy_to_fasttelethon(
+    metadata: &FileMetadata,
+    force_download: bool,
+) -> Result<Response<Body>, Infallible> {
     let config = Config::instance().await;
+
     let fasttelethon_url = config.fasttelethon_url();
-    
-    // Get storage channel ID from config
+
     let channel_id = match config.storage_channel_id() {
         Ok(id) => id.to_string(),
         Err(_) => {
             error!("STORAGE_CHANNEL_ID not configured");
+
             return Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("Large file download service not configured"))
+                .body(Body::from(
+                    "Large file download service not configured",
+                ))
                 .unwrap());
         }
     };
-    
-    // Get message_id from metadata (needed for FastTelethon MTProto download)
+
     let message_id = match metadata.message_id {
         Some(id) => id,
         None => {
-            // Fall back to Bot API for files without message_id (uploaded before FastTelethon integration)
-            warn!("File {} has no message_id, cannot use FastTelethon", metadata.unique_id);
+            warn!(
+                "File {} has no message_id",
+                metadata.unique_id
+            );
+
             return Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
-                .body(Body::from("File was uploaded before FastTelethon integration and cannot be downloaded via MTProto. Please re-upload the file."))
+                .body(Body::from(
+                    "File cannot be downloaded through the large-file service. Please re-upload it.",
+                ))
                 .unwrap());
         }
     };
-    
-    // Build FastTelethon download URL
-    let download_url = format!("{}/download/{}/{}", fasttelethon_url, channel_id, message_id);
-    
-    info!("Proxying large file download to FastTelethon: {}", download_url);
-    
-    // Make HTTP request to FastTelethon service
-    match reqwest::get(&download_url).await {
-        Ok(response) => {
-            if response.status().is_success() {
-                // Get headers from FastTelethon response (clone to avoid borrow issues)
-                let content_type = response.headers()
-                    .get("content-type")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
-                
-                let content_disposition = response.headers()
-                    .get("content-disposition")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("attachment; filename=\"{}\"", metadata.file_name));
-                
-                // Stream the response body
-                let bytes = response.bytes().await.unwrap_or_default();
-                
-                info!("Successfully proxied {} bytes from FastTelethon", bytes.len());
-                
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(CONTENT_TYPE, content_type)
-                    .header("Content-Disposition", content_disposition)
-                    .header("X-Content-Type-Options", "nosniff")
-                    .body(bytes.into())
-                    .unwrap())
-            } else {
-                error!("FastTelethon returned error: {}", response.status());
-                Ok(Response::builder()
-                    .status(StatusCode::BAD_GATEWAY)
-                    .body(Body::from("Failed to retrieve file from download service"))
-                    .unwrap())
-            }
-        }
+
+    let download_url = format!(
+        "{}/download/{}/{}",
+        fasttelethon_url,
+        channel_id,
+        message_id
+    );
+
+    info!(
+        "Streaming large file {} through FastTelethon",
+        metadata.file_name
+    );
+
+    let client = reqwest::Client::new();
+
+    let response = match client.get(&download_url).send().await {
+        Ok(response) => response,
         Err(e) => {
             error!("Failed to connect to FastTelethon: {:?}", e);
-            Ok(Response::builder()
+
+            return Ok(Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Body::from("Download service temporarily unavailable"))
-                .unwrap())
+                .body(Body::from(
+                    "Download service temporarily unavailable",
+                ))
+                .unwrap());
         }
+    };
+
+    if !response.status().is_success() {
+        error!(
+            "FastTelethon returned HTTP {}",
+            response.status()
+        );
+
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(
+                "Failed to retrieve file from download service",
+            ))
+            .unwrap());
     }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_else(|| {
+            metadata
+                .mime_type
+                .as_deref()
+                .unwrap_or("application/octet-stream")
+        });
+
+    let content_disposition = if force_download {
+        format!(
+            "attachment; filename=\"{}\"",
+            sanitize_filename(&metadata.file_name)
+        )
+    } else {
+        format!(
+            "inline; filename=\"{}\"",
+            sanitize_filename(&metadata.file_name)
+        )
+    };
+
+    /*
+     * IMPORTANT:
+     *
+     * Do NOT call response.bytes().
+     *
+     * Body::from_stream() forwards chunks as they arrive.
+     *
+     * Therefore a 2 GB file doesn't need to occupy 2 GB of RAM.
+     */
+    let stream = response.bytes_stream();
+
+    let body = Body::from_stream(stream);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, content_type)
+        .header(
+            "Content-Disposition",
+            content_disposition,
+        )
+        .header("X-Content-Type-Options", "nosniff")
+        .body(body)
+        .unwrap())
 }
 
-/// Lists all files from the file storage metadata
+
+// ------------------------------------------------------------
+// FILE LIST
+// ------------------------------------------------------------
+
 async fn files_list() -> Result<Response<Body>, Infallible> {
     info!("Files list accessed");
 
@@ -140,17 +209,29 @@ async fn files_list() -> Result<Response<Body>, Infallible> {
     if files.is_empty() {
         return Ok(Response::builder()
             .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "text/html")
-            .body(Body::from("<h1>Files in storage</h1><p>No files uploaded yet.</p>"))
+            .header(CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(
+                "<h1>Files in storage</h1>\
+                 <p>No files uploaded yet.</p>",
+            ))
             .unwrap());
     }
 
-    let mut html = String::from("<h1>Files in storage</h1><ul>");
+    let mut html =
+        String::from("<h1>Files in storage</h1><ul>");
 
     for file in files {
+        let filename = escape_html(&file.file_name);
+        let unique_id = escape_html(&file.unique_id);
+
         html.push_str(&format!(
-            "<li><a href=\"/files/{}\">{}</a> ({} bytes)</li>",
-            file.unique_id, file.file_name, file.file_size
+            "<li>\
+                <a href=\"/files/{}\">{}</a>\
+                ({} bytes)\
+            </li>",
+            unique_id,
+            filename,
+            file.file_size
         ));
     }
 
@@ -158,25 +239,38 @@ async fn files_list() -> Result<Response<Body>, Infallible> {
 
     Ok(Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/html")
+        .header(CONTENT_TYPE, "text/html; charset=utf-8")
         .body(Body::from(html))
         .unwrap())
 }
 
+
+// ------------------------------------------------------------
+// FILE API
+// ------------------------------------------------------------
+
 async fn files_api() -> Json<Vec<FileMetadata>> {
     let files = list_all_files().await;
+
     Json(files)
 }
 
-/// POST /api/files/upload?filename=<name>
-/// Body: raw file bytes (application/octet-stream). Stores the file in the
-/// Telegram storage channel via the bot, then records its metadata.
+
+// ------------------------------------------------------------
+// UPLOAD
+// ------------------------------------------------------------
+
 async fn files_upload(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Result<Response<Body>, Infallible> {
-    let filename = params.get("filename").cloned().unwrap_or_else(|| "upload.bin".to_string());
+    let raw_filename = params
+        .get("filename")
+        .cloned()
+        .unwrap_or_else(|| "upload.bin".to_string());
+
+    let filename = sanitize_filename(&raw_filename);
 
     if body.is_empty() {
         return Ok(Response::builder()
@@ -185,59 +279,115 @@ async fn files_upload(
             .unwrap());
     }
 
-    let storage_channel_id = match Config::instance().await.storage_channel_id() {
-        Ok(id) => id,
-        Err(e) => {
-            error!("STORAGE_CHANNEL_ID not configured: {}", e);
-            return Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Body::from("Storage channel not configured"))
-                .unwrap());
-        }
-    };
+    let storage_channel_id =
+        match Config::instance().await.storage_channel_id() {
+            Ok(id) => id,
 
-    let unique_id = format!("u{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
-    let tmp_path = std::env::temp_dir().join(format!("fileslink_upload_{}", unique_id));
-    let tmp_path_str = tmp_path.to_string_lossy().to_string();
+            Err(e) => {
+                error!(
+                    "STORAGE_CHANNEL_ID not configured: {}",
+                    e
+                );
 
-    // Write the received bytes to a temp file so the bot can push it as a document.
-    if let Err(e) = tokio::fs::write(&tmp_path_str, &body).await {
-        error!("Failed to write temp upload file: {:?}", e);
+                return Ok(Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .body(Body::from(
+                        "Storage channel not configured",
+                    ))
+                    .unwrap());
+            }
+        };
+
+    /*
+     * UUID is safer than a millisecond timestamp.
+     */
+    let unique_id = format!("u{}", Uuid::new_v4());
+
+    let tmp_path = std::env::temp_dir()
+        .join(format!("fileslink_upload_{}", unique_id));
+
+    /*
+     * This still temporarily holds the request in RAM because
+     * Axum's Bytes extractor is being used.
+     *
+     * For truly large uploads, change the upload handler to
+     * stream Body -> temp file.
+     */
+    if let Err(e) = tokio::fs::write(
+        &tmp_path,
+        &body,
+    )
+    .await
+    {
+        error!(
+            "Failed to write temporary upload: {:?}",
+            e
+        );
+
         return Ok(Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("Failed to write upload"))
+            .body(Body::from(
+                "Failed to write upload",
+            ))
             .unwrap());
     }
 
-    let sent = match state.bot
-        .send_document(ChatId(storage_channel_id), InputFile::file("upload", &tmp_path))
+    let sent = match state
+        .bot
+        .send_document(
+            ChatId(storage_channel_id),
+            InputFile::file(&tmp_path),
+        )
         .caption(&unique_id)
         .await
     {
-        Ok(s) => s,
+        Ok(message) => message,
+
         Err(e) => {
-            error!("Failed to send document to channel: {:?}", e);
-            let _ = tokio::fs::remove_file(&tmp_path_str).await;
+            error!(
+                "Failed to send document to Telegram: {:?}",
+                e
+            );
+
+            let _ =
+                tokio::fs::remove_file(&tmp_path).await;
+
             return Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("Failed to store file in Telegram"))
+                .body(Body::from(
+                    "Failed to store file in Telegram",
+                ))
                 .unwrap());
         }
     };
 
-    let _ = tokio::fs::remove_file(&tmp_path_str).await;
+    let _ =
+        tokio::fs::remove_file(&tmp_path).await;
 
     let stored_file_id = match sent.document() {
-        Some(d) => d.file.id.clone(),
+        Some(document) => document.file.id.clone(),
+
         None => {
             return Ok(Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("Stored message returned no file id"))
+                .body(Body::from(
+                    "Stored message returned no file id",
+                ))
                 .unwrap());
         }
     };
-    let file_size: u32 = body.len() as u32;
-    let mime_type = mime_guess::from_path(&filename).first().map(|m| m.to_string());
+
+    let file_size = body.len() as u32;
+
+    let mime_type = mime_guess::from_path(&filename)
+        .first()
+        .map(|mime| mime.to_string());
+
+    let uploaded_at =
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
 
     let metadata = FileMetadata {
         unique_id: unique_id.clone(),
@@ -245,196 +395,321 @@ async fn files_upload(
         file_name: filename.clone(),
         mime_type,
         file_size,
-        uploaded_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        uploaded_at,
         message_id: Some(sent.id.0),
     };
 
-    if let Err(e) = save_file_metadata(metadata).await {
-        error!("Failed to save metadata: {}", e);
+    if let Err(e) =
+        save_file_metadata(metadata).await
+    {
+        error!(
+            "Failed to save metadata: {}",
+            e
+        );
+
         return Ok(Response::builder()
             .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .body(Body::from("Failed to save metadata"))
+            .body(Body::from(
+                "Failed to save metadata",
+            ))
             .unwrap());
     }
 
-    info!("Uploaded file: {} ({} bytes) id={}", filename, file_size, unique_id);
-
-    let json = format!(
-        "{{\"success\":true,\"unique_id\":\"{}\",\"file_name\":\"{}\",\"size\":{}}}",
-        unique_id, filename, file_size
+    info!(
+        "Uploaded file: {} ({} bytes), id={}",
+        filename,
+        file_size,
+        unique_id
     );
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(json))
-        .unwrap())
+    /*
+     * Use Axum's JSON serialization instead of manually
+     * constructing JSON.
+     */
+    let response = UploadResponse {
+        success: true,
+        unique_id,
+        file_name: filename,
+        size: file_size,
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(response),
+    ).into_response())
 }
+
+
+// ------------------------------------------------------------
+// DOWNLOAD FILE
+// ------------------------------------------------------------
 
 async fn files_id(
     State(state): State<AppState>,
     extract::Path(id): extract::Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response<Body>, Infallible> {
-    debug!("Requested file with path: {}", id);
-    
-    // Extract unique ID from path (format: abc123_filename.ext) using shared util
-    let unique_id = extract_id_from_path(&id);
-    
-    debug!("Extracted unique ID: {}", unique_id);
+    debug!(
+        "Requested file with path: {}",
+        id
+    );
 
-    // Get file metadata from storage
-    let metadata = match get_file_metadata(unique_id).await {
-        Some(m) => m,
-        None => {
-            warn!("File not found with ID: {}", unique_id);
-            let body = not_found_handler().await;
-            return Ok((
-                StatusCode::NOT_FOUND,
-                [(CONTENT_TYPE, "text/html")],
-                body,
-            ).into_response());
-        }
-    };
+    let unique_id =
+        extract_id_from_path(&id);
 
-    info!("Found file: {} (Telegram ID: {})", metadata.file_name, metadata.telegram_file_id);
+    debug!(
+        "Extracted unique ID: {}",
+        unique_id
+    );
 
-    // Try to get file from Telegram, but if it's too big, proxy to FastTelethon
-    let file_info = match state.bot.get_file(&metadata.telegram_file_id).await {
-        Ok(info) => Some(info),
+    let metadata =
+        match get_file_metadata(unique_id).await {
+            Some(metadata) => metadata,
+
+            None => {
+                warn!(
+                    "File not found with ID: {}",
+                    unique_id
+                );
+
+                return Ok((
+                    StatusCode::NOT_FOUND,
+                    [(
+                        CONTENT_TYPE,
+                        "text/html; charset=utf-8",
+                    )],
+                    "<h1>404 Not Found</h1>\
+                     <p>The requested file does not exist.</p>",
+                ).into_response());
+            }
+        };
+
+    info!(
+        "Found file: {} (Telegram ID: {})",
+        metadata.file_name,
+        metadata.telegram_file_id
+    );
+
+    let force_download =
+        params.get("dl").is_some();
+
+    /*
+     * First try the Telegram Bot API.
+     *
+     * If Telegram says the file is too large,
+     * fall back to FastTelethon.
+     */
+    let file_info = match state
+        .bot
+        .get_file(&metadata.telegram_file_id)
+        .await
+    {
+        Ok(info) => info,
+
         Err(e) => {
             let error_msg = format!("{:?}", e);
-            if error_msg.contains("file is too big") || error_msg.contains("Bad Request") {
-                warn!("File too large for bot API, proxying to FastTelethon: {}", metadata.file_name);
-                
-                // Proxy to FastTelethon service for large files
-                return proxy_to_fasttelethon(&metadata).await;
-            } else {
-                error!("Failed to get file info from Telegram: {:?}", e);
-                return Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from("Failed to retrieve file from storage"))
-                    .unwrap());
+
+            if error_msg.contains("file is too big")
+                || error_msg.contains("Bad Request")
+            {
+                warn!(
+                    "File too large for Bot API: {}",
+                    metadata.file_name
+                );
+
+                return proxy_to_fasttelethon(
+                    &metadata,
+                    force_download,
+                )
+                .await;
             }
+
+            error!(
+                "Failed to get Telegram file info: {:?}",
+                e
+            );
+
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(
+                    "Failed to retrieve file from storage",
+                ))
+                .unwrap());
         }
     };
 
-    // Download file from Telegram if possible
+    /*
+     * Telegram Bot API download.
+     *
+     * Unfortunately teloxide's Download trait writes into
+     * an AsyncWrite, so this path still buffers the file.
+     *
+     * This is acceptable for small Bot API files, while
+     * large files use FastTelethon streaming above.
+     */
     let mut file_bytes = Vec::new();
-    if let Some(file_info) = file_info {
-        match state.bot.download_file(&file_info.path, &mut file_bytes).await {
-            Ok(_) => {
-                info!("Successfully downloaded {} bytes from Telegram", file_bytes.len());
-            }
-            Err(e) => {
-                error!("Failed to download file from Telegram: {:?}", e);
-                return Ok(Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from("Failed to download file from storage"))
-                    .unwrap());
-            }
-        }
+
+    if let Err(e) = state
+        .bot
+        .download_file(
+            &file_info.path,
+            &mut file_bytes,
+        )
+        .await
+    {
+        error!(
+            "Failed to download Telegram file: {:?}",
+            e
+        );
+
+        return Ok(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from(
+                "Failed to download file from storage",
+            ))
+            .unwrap());
     }
 
-    // Check if auto-close is requested via ?close=1
-    let auto_close = params.get("close").is_some();
-    
-    // Determine content type, allow force download via ?dl=1
-    let force_download = params.get("dl").is_some();
     let content_type = if force_download {
         "application/octet-stream".to_string()
     } else {
-        metadata.mime_type
-            .unwrap_or_else(|| "application/octet-stream".to_string())
+        metadata
+            .mime_type
+            .clone()
+            .unwrap_or_else(|| {
+                "application/octet-stream".to_string()
+            })
     };
 
-    // Use original filename from metadata, force download as attachment
-    let content_disposition = format!("inline; filename=\"{}\"", metadata.file_name);
+    let safe_filename =
+        sanitize_filename(&metadata.file_name);
 
-    info!("Serving file: {} ({} bytes) with content type: {}", 
-          metadata.file_name, file_bytes.len(), content_type);
+    let content_disposition = if force_download {
+        format!(
+            "attachment; filename=\"{}\"",
+            safe_filename
+        )
+    } else {
+        format!(
+            "inline; filename=\"{}\"",
+            safe_filename
+        )
+    };
 
-    // If auto-close requested, return HTML with auto-download and close script
-    if auto_close {
-        let html = format!(
-            r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Downloading {}</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; text-align: center; padding: 50px; }}
-        .loader {{ border: 5px solid #f3f3f3; border-top: 5px solid #3498db; 
-                   border-radius: 50%; width: 50px; height: 50px; 
-                   animation: spin 1s linear infinite; margin: 20px auto; }}
-        @keyframes spin {{ 0% {{ transform: rotate(0deg); }} 100% {{ transform: rotate(360deg); }} }}
-    </style>
-</head>
-<body>
-    <h2>Downloading {}</h2>
-    <div class="loader"></div>
-    <p>Your download will begin shortly...</p>
-    <p><small>This window will close automatically.</small></p>
-    <script>
-        // Create blob from base64 data and trigger download
-        const base64Data = "{}";
-        const byteCharacters = atob(base64Data);
-        const byteNumbers = new Array(byteCharacters.length);
-        for (let i = 0; i < byteCharacters.length; i++) {{
-            byteNumbers[i] = byteCharacters.charCodeAt(i);
-        }}
-        const byteArray = new Uint8Array(byteNumbers);
-        const blob = new Blob([byteArray], {{ type: '{}' }});
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = "{}";
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        
-        // Close window after 2 seconds
-        setTimeout(function() {{
-            window.close();
-        }}, 2000);
-    </script>
-</body>
-</html>"#,
-            metadata.file_name,
-            metadata.file_name,
-            base64::engine::general_purpose::STANDARD.encode(&file_bytes),
-            content_type,
-            metadata.file_name
-        );
-        
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(html.into())
-            .unwrap());
-    }
+    info!(
+        "Serving {} ({} bytes)",
+        safe_filename,
+        file_bytes.len()
+    );
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, content_type)
-        .header("Content-Disposition", content_disposition)
-        .header("X-Content-Type-Options", "nosniff")
+        .header(
+            "Content-Disposition",
+            content_disposition,
+        )
+        .header(
+            "Content-Length",
+            file_bytes.len(),
+        )
+        .header(
+            "X-Content-Type-Options",
+            "nosniff",
+        )
         .body(file_bytes.into())
         .unwrap())
 }
 
+
+// ------------------------------------------------------------
+// ROOT
+// ------------------------------------------------------------
+
 async fn root() -> Html<&'static str> {
     info!("Root path accessed");
 
-    Html("\
-    <h1>Server working</h1>\
-    <div><a href=\"https://github.com/bytetrix/fileslink\">GitHub</a></div>\
-    ")
+    Html(
+        "\
+        <h1>Server working</h1>\
+        <div>\
+            <a href=\"https://github.com/bytetrix/fileslink\">\
+                GitHub\
+            </a>\
+        </div>\
+        ",
+    )
 }
 
+
+// ------------------------------------------------------------
+// 404
+// ------------------------------------------------------------
+
 async fn not_found_handler() -> Html<&'static str> {
-    Html("\
-    <h1>404 Not Found</h1>\
-    <p>The page you are looking for does not exist.</p>\
-    <a href=\"/\">Go back to the homepage</a>\
-    ")
+    Html(
+        "\
+        <h1>404 Not Found</h1>\
+        <p>The page you are looking for does not exist.</p>\
+        <a href=\"/\">Go back to the homepage</a>\
+        ",
+    )
+}
+
+
+// ------------------------------------------------------------
+// HELPERS
+// ------------------------------------------------------------
+
+fn sanitize_filename(filename: &str) -> String {
+    let filename = filename
+        .replace('\\', "_")
+        .replace('/', "_")
+        .replace('"', "_")
+        .replace('\'', "_")
+        .replace('<', "_")
+        .replace('>', "_")
+        .replace(':', "_")
+        .replace('|', "_")
+        .replace('?', "_")
+        .replace('*', "_");
+
+    let filename = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+
+    let filename = filename.trim();
+
+    if filename.is_empty() {
+        "download.bin".to_string()
+    } else {
+        filename
+            .chars()
+            .take(255)
+            .collect()
+    }
+}
+
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+
+// ------------------------------------------------------------
+// API RESPONSE
+// ------------------------------------------------------------
+
+#[derive(serde::Serialize)]
+struct UploadResponse {
+    success: bool,
+    unique_id: String,
+    file_name: String,
+    size: u32,
 }
