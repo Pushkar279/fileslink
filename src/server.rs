@@ -1,22 +1,26 @@
 use std::convert::Infallible;
 use std::collections::HashMap;
+use std::sync::Arc;use std::convert::Infallible;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::response::IntoResponse;
 use axum::Json;
 use axum::{
-    body::Body,
-    extract::{self, State, Query},
-    response::{Html, Response},
-    routing::{get, Router},
+    body::{Body, Bytes},
+    extract::{self, DefaultBodyLimit, Query, State},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post, Router},
 };
 use http::{header::CONTENT_TYPE, StatusCode};
 use log::{debug, error, info, warn};
 use teloxide::net::Download;
+use teloxide::payloads::SendDocumentSetters;
 use teloxide::prelude::Requester;
+use teloxide::types::{ChatId, InputFile};
 use base64::Engine;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use shared::file_storage::{get_file_metadata, list_all_files, FileMetadata};
+use shared::file_storage::{get_file_metadata, list_all_files, save_file_metadata, FileMetadata};
 use crate::config::Config;
 use shared::link_utils::extract_id_from_path;
 
@@ -34,11 +38,15 @@ pub async fn create_app(bot: Arc<teloxide::Bot>) -> Router {
         .route("/", get(root))
         .route("/files/:id", get(files_id))
         .route("/api/files", get(files_api))
+        .route("/api/files/upload", post(files_upload))
         .with_state(state);
 
     if enable_files_route {
         router = router.route("/files", get(files_list));
     }
+
+    // Allow large file uploads (50 MB) through the bot API.
+    router = router.layer(DefaultBodyLimit::max(50 * 1024 * 1024));
 
     router.fallback(not_found_handler)
 }
@@ -160,6 +168,109 @@ async fn files_list() -> Result<Response<Body>, Infallible> {
 async fn files_api() -> Json<Vec<FileMetadata>> {
     let files = list_all_files().await;
     Json(files)
+}
+
+/// POST /api/files/upload?filename=<name>
+/// Body: raw file bytes (application/octet-stream). Stores the file in the
+/// Telegram storage channel via the bot, then records its metadata.
+async fn files_upload(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Result<Response<Body>, Infallible> {
+    let filename = params.get("filename").cloned().unwrap_or_else(|| "upload.bin".to_string());
+
+    if body.is_empty() {
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Empty body"))
+            .unwrap());
+    }
+
+    let storage_channel_id = match Config::instance().await.storage_channel_id() {
+        Ok(id) => id,
+        Err(e) => {
+            error!("STORAGE_CHANNEL_ID not configured: {}", e);
+            return Ok(Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from("Storage channel not configured"))
+                .unwrap());
+        }
+    };
+
+    let unique_id = format!("u{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis());
+    let tmp_path = std::env::temp_dir().join(format!("fileslink_upload_{}", unique_id));
+    let tmp_path_str = tmp_path.to_string_lossy().to_string();
+
+    // Write the received bytes to a temp file so the bot can push it as a document.
+    if let Err(e) = tokio::fs::write(&tmp_path_str, &body).await {
+        error!("Failed to write temp upload file: {:?}", e);
+        return Ok(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("Failed to write upload"))
+            .unwrap());
+    }
+
+    let sent = match state.bot
+        .send_document(ChatId(storage_channel_id), InputFile::file("upload", &tmp_path))
+        .caption(&unique_id)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to send document to channel: {:?}", e);
+            let _ = tokio::fs::remove_file(&tmp_path_str).await;
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("Failed to store file in Telegram"))
+                .unwrap());
+        }
+    };
+
+    let _ = tokio::fs::remove_file(&tmp_path_str).await;
+
+    let stored_file_id = match sent.document() {
+        Some(d) => d.file.id.clone(),
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("Stored message returned no file id"))
+                .unwrap());
+        }
+    };
+    let file_size: u32 = body.len() as u32;
+    let mime_type = mime_guess::from_path(&filename).first().map(|m| m.to_string());
+
+    let metadata = FileMetadata {
+        unique_id: unique_id.clone(),
+        telegram_file_id: stored_file_id,
+        file_name: filename.clone(),
+        mime_type,
+        file_size,
+        uploaded_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        message_id: Some(sent.id.0),
+    };
+
+    if let Err(e) = save_file_metadata(metadata).await {
+        error!("Failed to save metadata: {}", e);
+        return Ok(Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Body::from("Failed to save metadata"))
+            .unwrap());
+    }
+
+    info!("Uploaded file: {} ({} bytes) id={}", filename, file_size, unique_id);
+
+    let json = format!(
+        "{{\"success\":true,\"unique_id\":\"{}\",\"file_name\":\"{}\",\"size\":{}}}",
+        unique_id, filename, file_size
+    );
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(json))
+        .unwrap())
 }
 
 async fn files_id(
