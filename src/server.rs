@@ -837,16 +837,9 @@ async fn files_id(
                  * If Telegram Bot API refuses the file because
                  * it is too large, use FastTelethon.
                  */
-                if error_msg
-                    .contains(
-                        "file is too big"
-                    )
-                    || error_msg
-                        .contains(
-                            "Bad Request"
-                        )
+                if error_msg.contains("file is too big")
+                    || error_msg.contains("Bad Request")
                 {
-
                     warn!(
                         "File too large for Bot API: {}",
                         metadata.file_name
@@ -858,3 +851,192 @@ async fn files_id(
                     )
                     .await;
                 }
+
+                error!(
+                    "Failed to get file info from Telegram: {:?}",
+                    e
+                );
+
+                return Ok(
+                    Response::builder()
+                        .status(
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        )
+                        .body(
+                            Body::from(
+                                "Failed to retrieve file from storage"
+                            )
+                        )
+                        .unwrap()
+                );
+            }
+        };
+
+    /*
+     * Download normal-sized files through the Telegram Bot API.
+     */
+    let mut file_bytes = Vec::new();
+
+    if let Err(e) = state
+        .bot
+        .download_file(
+            &file_info.path,
+            &mut file_bytes
+        )
+        .await
+    {
+        error!(
+            "Failed to download file from Telegram: {:?}",
+            e
+        );
+
+        return Ok(
+            Response::builder()
+                .status(
+                    StatusCode::INTERNAL_SERVER_ERROR
+                )
+                .body(
+                    Body::from(
+                        "Failed to download file from storage"
+                    )
+                )
+                .unwrap()
+        );
+    }
+
+    info!(
+        "Successfully downloaded {} bytes from Telegram",
+        file_bytes.len()
+    );
+
+    let content_type =
+        if force_download {
+            "application/octet-stream".to_string()
+        } else {
+            metadata
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| {
+                    "application/octet-stream".to_string()
+                })
+        };
+
+    let safe_filename =
+        sanitize_filename(
+            &metadata.file_name
+        );
+
+    let content_disposition =
+        if force_download {
+            format!(
+                "attachment; filename=\"{}\"",
+                safe_filename
+            )
+        } else {
+            format!(
+                "inline; filename=\"{}\"",
+                safe_filename
+            )
+        };
+
+    Ok(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                CONTENT_TYPE,
+                content_type
+            )
+            .header(
+                "Content-Disposition",
+                content_disposition
+            )
+            .header(
+                "X-Content-Type-Options",
+                "nosniff"
+            )
+            .body(
+                Body::from(file_bytes)
+            )
+            .unwrap()
+    )
+}
+
+
+// ============================================================
+// ROOT
+// ============================================================
+
+async fn root() -> Html<&'static str> {
+    info!("Root path accessed");
+
+    Html(
+        "<h1>Server working</h1>\
+         <div><a href=\"https://github.com/Pushkar279/fileslink\">GitHub</a></div>"
+    )
+}
+
+
+// ============================================================
+// 404
+// ============================================================
+
+async fn not_found_handler() -> Html<&'static str> {
+    Html(
+        "<h1>404 Not Found</h1>\
+         <p>The page you are looking for does not exist.</p>\
+         <a href=\"/\">Go back to the homepage</a>"
+    )
+}
+
+
+// ============================================================
+// FILENAME SANITIZER
+// ============================================================
+
+fn sanitize_filename(filename: &str) -> String {
+    let sanitized: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(c, '"' | '\\' | '/' | '<' | '>' | ':')
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    if sanitized.trim().is_empty() {
+        "download.bin".to_string()
+    } else {
+        sanitized
+    }
+}
+
+
+// ============================================================
+// HTML ESCAPING
+// ============================================================
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+
+// ============================================================
+// UPLOAD RESPONSE
+// ============================================================
+
+#[derive(serde::Serialize)]
+struct UploadResponse {
+    success: bool,
+    unique_id: String,
+    file_name: String,
+    size: u32,
+}
